@@ -24,6 +24,7 @@ from common.djangoapps.edxmako.shortcuts import render_to_response
 from common.djangoapps.student.auth import has_course_author_access
 from common.djangoapps.xblock_django.api import authorable_xblocks, disabled_xblocks
 from common.djangoapps.xblock_django.models import XBlockStudioConfigurationFlag
+from cms.djangoapps.contentstore.toggles import use_new_problem_editor
 from openedx.core.lib.xblock_utils import get_aside_from_xblock, is_xblock_aside
 from openedx.core.djangoapps.discussions.models import DiscussionsConfiguration
 from xmodule.modulestore.django import modulestore  # lint-amnesty, pylint: disable=wrong-import-order
@@ -31,7 +32,7 @@ from xmodule.modulestore.exceptions import ItemNotFoundError  # lint-amnesty, py
 
 from ..utils import get_lms_link_for_item, get_sibling_urls, reverse_course_url
 from .helpers import get_parent_xblock, is_unit, xblock_type_display_name
-from .item import StudioEditModuleRuntime, add_container_page_publishing_info, create_xblock_info
+from .block import StudioEditModuleRuntime, add_container_page_publishing_info, create_xblock_info
 
 __all__ = [
     'container_handler',
@@ -95,7 +96,7 @@ def _load_mixed_class(category):
     """
     Load an XBlock by category name, and apply all defined mixins
     """
-    component_class = XBlock.load_class(category, select=settings.XBLOCK_SELECT_FUNCTION)
+    component_class = XBlock.load_class(category)
     mixologist = Mixologist(settings.XBLOCK_MIXINS)
     return mixologist.mix(component_class)
 
@@ -353,9 +354,16 @@ def get_component_templates(courselike, library=False):  # lint-amnesty, pylint:
                             )
                         )
 
+        #If using new problem editor, we select problem type inside the editor
+        # because of this, we only show one problem.
+        if category == 'problem' and use_new_problem_editor():
+            templates_for_category = [
+                template for template in templates_for_category if template['boilerplate_name'] == 'blank_common.yaml'
+            ]
+
         # Add any advanced problem types. Note that these are different xblocks being stored as Advanced Problems,
         # currently not supported in libraries .
-        if category == 'problem' and not library:
+        if category == 'problem' and not library and not use_new_problem_editor():
             disabled_block_names = [block.name for block in disabled_xblocks()]
             advanced_problem_types = [advanced_problem_type for advanced_problem_type in ADVANCED_PROBLEM_TYPES
                                       if advanced_problem_type['component'] not in disabled_block_names]
@@ -538,13 +546,7 @@ def component_handler(request, usage_key_string, handler, suffix=''):
     """
     usage_key = UsageKey.from_string(usage_key_string)
 
-    # Addendum:
-    # TNL 101-62 studio write permission is also checked for editing content.
-
-    if handler == 'submit_studio_edits' and not has_course_author_access(request.user, usage_key.course_key):
-        raise PermissionDenied("No studio write Permissions")
-
-    # Let the module handle the AJAX
+    # Let the block handle the AJAX
     req = django_to_webob_request(request)
 
     try:
@@ -565,6 +567,18 @@ def component_handler(request, usage_key_string, handler, suffix=''):
 
     # unintentional update to handle any side effects of handle call
     # could potentially be updating actual course data or simply caching its values
-    modulestore().update_item(descriptor, request.user.id, asides=asides)
+    # Addendum:
+    # TNL 101-62 studio write permission is also checked for editing content.
+
+    if has_course_author_access(request.user, usage_key.course_key):
+        modulestore().update_item(descriptor, request.user.id, asides=asides)
+    else:
+        #fail quietly if user is not course author.
+        log.warning(
+            "%s does not have have studio write permissions on course: %s. write operations not performed on %r",
+            request.user.id,
+            usage_key.course_key,
+            handler
+        )
 
     return webob_to_django_response(resp)

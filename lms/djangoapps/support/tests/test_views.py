@@ -24,13 +24,14 @@ from edx_proctoring.runtime import set_runtime_service
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
 from edx_proctoring.tests.test_services import MockLearningSequencesService, MockScheduleItemData
 from edx_proctoring.tests.utils import ProctoredExamTestCase
+from oauth2_provider.models import AccessToken, RefreshToken
 from opaque_keys.edx.locator import BlockUsageLocator
 from organizations.tests.factories import OrganizationFactory
 from pytz import UTC
 from rest_framework import status
 from social_django.models import UserSocialAuth
 from xmodule.modulestore.tests.django_utils import (
-    TEST_DATA_MONGO_AMNESTY_MODULESTORE, ModuleStoreTestCase, SharedModuleStoreTestCase,
+    TEST_DATA_SPLIT_MODULESTORE, ModuleStoreTestCase, SharedModuleStoreTestCase,
 )
 from xmodule.modulestore.tests.factories import CourseFactory
 
@@ -58,6 +59,7 @@ from lms.djangoapps.verify_student.models import VerificationDeadline
 from lms.djangoapps.verify_student.services import IDVerificationService
 from lms.djangoapps.verify_student.tests.factories import SSOVerificationFactory
 from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
+from openedx.core.djangoapps.oauth_dispatch.tests import factories
 from openedx.features.content_type_gating.models import ContentTypeGatingConfig
 from openedx.features.course_duration_limits.models import CourseDurationLimitConfig
 from openedx.features.enterprise_support.api import enterprise_is_enabled
@@ -155,6 +157,15 @@ class SupportViewManageUserTests(SupportViewTestCase):
         test_user = UserFactory(
             username='foobar', email='foobar@foobar.com', password='foobar'
         )
+
+        application = factories.ApplicationFactory(user=test_user)
+        access_token = factories.AccessTokenFactory(user=test_user, application=application)
+        factories.RefreshTokenFactory(
+            user=test_user, application=application, access_token=access_token
+        )
+        assert 0 != AccessToken.objects.filter(user=test_user).count()
+        assert 0 != RefreshToken.objects.filter(user=test_user).count()
+
         url = reverse('support:manage_user_detail') + test_user.username
         response = self.client.post(url, data={
             'username_or_email': test_user.username,
@@ -164,6 +175,8 @@ class SupportViewManageUserTests(SupportViewTestCase):
         assert data['success_msg'] == 'User Disabled Successfully'
         test_user = User.objects.get(username=test_user.username, email=test_user.email)
         assert test_user.has_usable_password() is False
+        assert 0 == AccessToken.objects.filter(user=test_user).count()
+        assert 0 == RefreshToken.objects.filter(user=test_user).count()
 
 
 @ddt.ddt
@@ -254,7 +267,7 @@ class SupportViewCertificatesTests(SupportViewTestCase):
     """
     Tests for the certificates support view.
     """
-    MODULESTORE = TEST_DATA_MONGO_AMNESTY_MODULESTORE
+    MODULESTORE = TEST_DATA_SPLIT_MODULESTORE
 
     def setUp(self):
         """Make the user support staff. """
@@ -277,7 +290,9 @@ class SupportViewCertificatesTests(SupportViewTestCase):
         url = reverse("support:certificates") + "?user=student@example.com&course_id=" + quote(str(self.course.id))
         response = self.client.get(url)
         self.assertContains(response, "userFilter: 'student@example.com'")
-        self.assertContains(response, "courseFilter: '" + str(self.course.id) + "'")
+        # use replase due to escaping course id:
+        # https://docs.djangoproject.com/en/dev/ref/templates/builtins/#escapejs
+        self.assertContains(response, "courseFilter: '" + str(self.course.id).replace('-', '\\u002D') + "'")
 
 
 @ddt.ddt
@@ -1846,11 +1861,14 @@ class TestOnboardingView(SupportViewTestCase, ProctoredExamTestCase):
     """
     Tests for OnboardingView
     """
-    MODULESTORE = TEST_DATA_MONGO_AMNESTY_MODULESTORE
+    MODULESTORE = TEST_DATA_SPLIT_MODULESTORE
 
     def setUp(self):
         super().setUp()
         SupportStaffRole().add_users(self.user)
+
+        # update default course key
+        self.course_id = 'course-v1:a+b+c'
 
         self.proctored_exam_id = self._create_proctored_exam()
         self.onboarding_exam_id = self._create_onboarding_exam()
@@ -1891,7 +1909,7 @@ class TestOnboardingView(SupportViewTestCase, ProctoredExamTestCase):
 
     def _create_enrollment(self):
         """ Create enrollment in default course """
-        # default course key = 'a/b/c'
+        # updated course key = 'course-v1:a+b+c'
         self.course = CourseFactory.create(
             org='a',
             course='b',
@@ -2011,7 +2029,7 @@ class TestOnboardingView(SupportViewTestCase, ProctoredExamTestCase):
         update_attempt_status(attempt_id, ProctoredExamStudentAttemptStatus.submitted)
 
         # Create an attempt in the other course that has been verified
-        other_course_id = 'x/y/z'
+        other_course_id = 'course-v1:x+y+z'
         other_course_onboarding_exam = ProctoredExam.objects.create(
             course_id=other_course_id,
             content_id=self.other_course_content,
@@ -2044,8 +2062,8 @@ class TestOnboardingView(SupportViewTestCase, ProctoredExamTestCase):
 
         # assert that originally verified enrollment is reflected correctly
         self.assertEqual(response_data['verified_in']['onboarding_status'], 'verified')
-        self.assertEqual(response_data['verified_in']['course_id'], 'x/y/z')
+        self.assertEqual(response_data['verified_in']['course_id'], other_course_id)
 
         # assert that most recent enrollment (current status) has other_course_approved status
         self.assertEqual(response_data['current_status']['onboarding_status'], 'other_course_approved')
-        self.assertEqual(response_data['current_status']['course_id'], 'a/b/c')
+        self.assertEqual(response_data['current_status']['course_id'], self.course_id)

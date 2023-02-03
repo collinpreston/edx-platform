@@ -2,7 +2,7 @@
 
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional
 
@@ -11,10 +11,10 @@ from django.core.cache import cache
 from django.db import transaction
 from django.dispatch import receiver
 from edx_toggles.toggles import SettingToggle
-from edx_event_bus_kafka import get_producer
 from opaque_keys.edx.keys import CourseKey
 from openedx_events.content_authoring.data import CourseCatalogData, CourseScheduleData
 from openedx_events.content_authoring.signals import COURSE_CATALOG_INFO_CHANGED
+from openedx_events.event_bus import get_producer
 from pytz import UTC
 
 from cms.djangoapps.contentstore.courseware_index import (
@@ -23,7 +23,7 @@ from cms.djangoapps.contentstore.courseware_index import (
     LibrarySearchIndexer,
 )
 from common.djangoapps.track.event_transaction_utils import get_event_transaction_id, get_event_transaction_type
-from common.djangoapps.util.module_utils import yield_dynamic_descriptor_descendants
+from common.djangoapps.util.block_utils import yield_dynamic_descriptor_descendants
 from lms.djangoapps.grades.api import task_compute_all_grades_for_course
 from openedx.core.djangoapps.content.learning_sequences.api import key_supports_outlines
 from openedx.core.djangoapps.discussions.tasks import update_discussions_settings_from_course_task
@@ -66,7 +66,7 @@ def locked(expiry_seconds, key):  # lint-amnesty, pylint: disable=missing-functi
 SEND_CATALOG_INFO_SIGNAL = SettingToggle('SEND_CATALOG_INFO_SIGNAL', default=False, module_name=__name__)
 
 
-def create_catalog_data_for_signal(course_key: CourseKey) -> Optional[CourseCatalogData]:
+def _create_catalog_data_for_signal(course_key: CourseKey) -> (Optional[datetime], Optional[CourseCatalogData]):
     """
     Creates data for catalog-info-changed signal when course is published.
 
@@ -74,16 +74,19 @@ def create_catalog_data_for_signal(course_key: CourseKey) -> Optional[CourseCata
         course_key: Key of the course to announce catalog info changes for
 
     Returns:
-        Data for signal, or None if not appropriate to send on this signal.
+        (datetime, CourseCatalogData): Tuple including the timestamp of the
+            event, and data for signal, or (None, None) if not appropriate
+            to send on this signal.
     """
     # Only operate on real courses, not libraries.
     if not course_key.is_course:
-        return None
+        return None, None
 
     store = modulestore()
     with store.branch_setting(ModuleStoreEnum.Branch.published_only, course_key):
         course = store.get_course(course_key)
-        return CourseCatalogData(
+        timestamp = course.subtree_edited_on.replace(tzinfo=timezone.utc)
+        return timestamp, CourseCatalogData(
             course_key=course_key.for_branch(None),  # Shouldn't be necessary, but just in case...
             name=course.display_name,
             schedule_data=CourseScheduleData(
@@ -103,9 +106,9 @@ def emit_catalog_info_changed_signal(course_key: CourseKey):
     Given the key of a recently published course, send course data to catalog-info-changed signal.
     """
     if SEND_CATALOG_INFO_SIGNAL.is_enabled():
-        catalog_info = create_catalog_data_for_signal(course_key)
+        timestamp, catalog_info = _create_catalog_data_for_signal(course_key)
         if catalog_info is not None:
-            COURSE_CATALOG_INFO_CHANGED.send_event(catalog_info=catalog_info)
+            COURSE_CATALOG_INFO_CHANGED.send_event(time=timestamp, catalog_info=catalog_info)
 
 
 @receiver(SignalHandler.course_published)
@@ -125,9 +128,9 @@ def listen_for_course_publish(sender, course_key, **kwargs):  # pylint: disable=
         dump_course_to_neo4j
     )
 
-    # register special exams asynchronously
+    # register special exams asynchronously after the data is ready
     course_key_str = str(course_key)
-    update_special_exams_and_publish.delay(course_key_str)
+    transaction.on_commit(lambda: update_special_exams_and_publish.delay(course_key_str))
 
     if key_supports_outlines(course_key):
         # Push the course outline to learning_sequences asynchronously.
@@ -142,7 +145,10 @@ def listen_for_course_publish(sender, course_key, **kwargs):  # pylint: disable=
     if CoursewareSearchIndexer.indexing_is_enabled() and CourseAboutSearchIndexer.indexing_is_enabled():
         update_search_index.delay(course_key_str, datetime.now(UTC).isoformat())
 
-    update_discussions_settings_from_course_task.delay(course_key_str)
+    update_discussions_settings_from_course_task.apply_async(
+        args=[course_key_str],
+        countdown=settings.DISCUSSION_SETTINGS['COURSE_PUBLISH_TASK_DELAY'],
+    )
 
     # Send to a signal for catalog info changes as well, but only once we know the transaction is committed.
     transaction.on_commit(lambda: emit_catalog_info_changed_signal(course_key))
@@ -156,6 +162,7 @@ def listen_for_course_catalog_info_changed(sender, signal, **kwargs):
     get_producer().send(
         signal=COURSE_CATALOG_INFO_CHANGED, topic='course-catalog-info-changed',
         event_key_field='catalog_info.course_key', event_data={'catalog_info': kwargs['catalog_info']},
+        event_metadata=kwargs['metadata'],
     )
 
 
@@ -200,12 +207,12 @@ def handle_item_deleted(**kwargs):
         # Strip branch info
         usage_key = usage_key.for_branch(None)
         course_key = usage_key.course_key
-        deleted_module = modulestore().get_item(usage_key)
-        for module in yield_dynamic_descriptor_descendants(deleted_module, kwargs.get('user_id')):
+        deleted_block = modulestore().get_item(usage_key)
+        for block in yield_dynamic_descriptor_descendants(deleted_block, kwargs.get('user_id')):
             # Remove prerequisite milestone data
-            gating_api.remove_prerequisite(module.location)
+            gating_api.remove_prerequisite(block.location)
             # Remove any 'requires' course content milestone relationships
-            gating_api.set_required_content(course_key, module.location, None, None, None)
+            gating_api.set_required_content(course_key, block.location, None, None, None)
 
 
 @receiver(GRADING_POLICY_CHANGED)
